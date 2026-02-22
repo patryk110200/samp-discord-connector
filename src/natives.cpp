@@ -15,10 +15,25 @@
 #include "Command.hpp"
 #include "CommandInteraction.hpp"
 #include <fmt/printf.h>
+#include <unordered_map>
 
 #ifdef ERROR
 #undef ERROR
 #endif
+
+namespace
+{
+	std::unordered_map<cell, CommandOption_t> g_PendingCommandOptions;
+	std::unordered_map<cell, CommandOption*> g_PendingCommandOptionIndex;
+	cell g_NextCommandOptionId = 1;
+
+	void ClearPendingCommandOptions()
+	{
+		g_PendingCommandOptions.clear();
+		g_PendingCommandOptionIndex.clear();
+		g_NextCommandOptionId = 1;
+	}
+}
 /*
 // native native_name(...);
 AMX_DECLARE_NATIVE(Native::native_name)
@@ -255,7 +270,7 @@ AMX_DECLARE_NATIVE(Native::DCC_GetChannelParentCategory)
 	return 1;
 }
 
-// native DCC_SendChannelMessage(DCC_Channel:channel, const message[], 
+// native DCC_SendChannelMessage(DCC_Channel:channel, const message[],
 //     const callback[] = "", const format[] = "", {Float, _}:...);
 AMX_DECLARE_NATIVE(Native::DCC_SendChannelMessage)
 {
@@ -2379,7 +2394,7 @@ AMX_DECLARE_NATIVE(Native::DCC_EscapeMarkdown)
 	return ret_val;
 }
 
-// native DCC_CreateEmbedMessage(const title[] = "", const description[] = "", const url[] = "", const timestamp[] = "", int color = 0, const footer_text[] = "", const footer_icon_url[] = "", 
+// native DCC_CreateEmbedMessage(const title[] = "", const description[] = "", const url[] = "", const timestamp[] = "", int color = 0, const footer_text[] = "", const footer_icon_url[] = "",
 //		const thumbnail_url[] = "", const image_url[] = "");
 AMX_DECLARE_NATIVE(Native::DCC_CreateEmbed)
 {
@@ -2420,7 +2435,7 @@ AMX_DECLARE_NATIVE(Native::DCC_DeleteEmbed)
 	return 1;
 }
 
-// native DCC_SendChannelEmbedMessage(DCC_Channel:channel, DCC_Embed:embed, const message[] = "", 
+// native DCC_SendChannelEmbedMessage(DCC_Channel:channel, DCC_Embed:embed, const message[] = "",
 //     const callback[] = "", const format[] = "", {Float, _}:...);
 AMX_DECLARE_NATIVE(Native::DCC_SendChannelEmbedMessage)
 {
@@ -2862,7 +2877,7 @@ AMX_DECLARE_NATIVE(Native::DCC_CreateCommand)
 		id = CommandManager::Get()->AddCommand(name, description);
 		auto & command = CommandManager::Get()->FindCommand(id);
 		command->SetCallback(callback);
-		
+
 		/*if (options_size)
 		{
 			cell* array = nullptr;
@@ -2886,13 +2901,13 @@ AMX_DECLARE_NATIVE(Native::DCC_CreateCommand)
 		/*if (permissions_size)
 		{
 			cell* array = nullptr;
-			
+
 			if (amx_GetAddr(amx, params[4], &array) != AMX_ERR_NONE)
 			{
 				Logger::Get()->LogNative(samplog_LogLevel::INFO, "unable to find the array for permissions");
 				return 0;
 			}
-			
+
 			int location = 0;
 			size_t i = permissions_size - 2; ignore default ""
 			for (; i != 0;)
@@ -2903,7 +2918,7 @@ AMX_DECLARE_NATIVE(Native::DCC_CreateCommand)
 				amx_GetString(&string[0], &array[location], 0, len + 1);
 				i -= len;
 				location += len + 1;
-				
+
 				if (string.length())
 				{
 					Logger::Get()->Log(samplog_LogLevel::ERROR, "role {} {}", string, i);
@@ -2918,18 +2933,37 @@ AMX_DECLARE_NATIVE(Native::DCC_CreateCommand)
 		{
 			Logger::Get()->LogNative(samplog_LogLevel::INFO, "command '{:s}' created with NO permissions!", name);
 		}*/
-		CommandOption_t option = std::unique_ptr<CommandOption>(new CommandOption());
-		option->SetType(COMMAND_OPTION_TYPE::OPTION_STRING);
-		option->SetName("arguments");
-		option->SetRequired(false);
-		option->SetDescription("just type");
 		command->AllowEveryone(allow_everyone);
-		command->AddOption("arguments", option);
+		if (g_PendingCommandOptions.empty())
+		{
+			CommandOption_t option = std::unique_ptr<CommandOption>(new CommandOption());
+			option->SetType(COMMAND_OPTION_TYPE::OPTION_STRING);
+			option->SetName("arguments");
+			option->SetRequired(false);
+			option->SetDescription("just type");
+			command->AddOption("arguments", option);
+		}
+		else
+		{
+			for (auto & pending_option : g_PendingCommandOptions)
+			{
+				command->AddOption(pending_option.second->GetName(), pending_option.second);
+			}
+			ClearPendingCommandOptions();
+		}
 		command->SetGuild(guild);
 		command->HandleNewCreation();
 	}
 	else
 	{
+		if (!g_PendingCommandOptions.empty())
+		{
+			Logger::Get()->LogNative(
+				samplog_LogLevel::WARNING,
+				"command '{}' already exists; pending options were ignored",
+				name);
+			ClearPendingCommandOptions();
+		}
 		auto & command = CommandManager::Get()->FindCommand(id);
 		command->SetCallback(callback);
 	}
@@ -3031,7 +3065,7 @@ AMX_DECLARE_NATIVE(Native::DCC_GetInteractionChannel)
 		return 0;
 	}
 
-	
+
 	cell* dest = nullptr;
 	if (amx_GetAddr(amx, params[2], &dest) != AMX_ERR_NONE || dest == nullptr)
 	{
@@ -3150,18 +3184,90 @@ AMX_DECLARE_NATIVE(Native::DCC_DeleteCommand)
 	return 1;
 }
 
-/* Maybe this will work one day :))
-// native DCC_Option:DCC_AddCommandOption(const name[], const description[], type, bool:required = true, DCC_Option:parent_option);
 AMX_DECLARE_NATIVE(Native::DCC_AddCommandOption)
 {
+	ScopedDebugInfo dbg_info(amx, "DCC_AddCommandOption", params, "ssiii");
 	const auto& name = amx_GetCppString(amx, params[1]);
 	const auto& description = amx_GetCppString(amx, params[2]);
-	int type = static_cast<int>(params[3]);
+	const int type = static_cast<int>(params[3]);
 	bool required = static_cast<bool>(params[4]);
-	
-	return 1;
+	const cell parent_option_id = params[5];
+
+	if (name.empty() || description.empty())
+	{
+		Logger::Get()->LogNative(samplog_LogLevel::ERROR, "name/description must not be empty");
+		return 0;
+	}
+
+	if (type < static_cast<int>(COMMAND_OPTION_TYPE::OPTION_SUB_COMMAND) ||
+		type > static_cast<int>(COMMAND_OPTION_TYPE::OPTION_ROLE))
+	{
+		Logger::Get()->LogNative(samplog_LogLevel::ERROR, "invalid option type '{}'", type);
+		return 0;
+	}
+
+	if (type == static_cast<int>(COMMAND_OPTION_TYPE::OPTION_SUB_COMMAND) ||
+		type == static_cast<int>(COMMAND_OPTION_TYPE::OPTION_SUB_COMMAND_GROUP))
+	{
+		required = false;
+	}
+
+	CommandOption_t option = std::unique_ptr<CommandOption>(new CommandOption());
+	option->SetType(static_cast<COMMAND_OPTION_TYPE>(type));
+	option->SetName(name);
+	option->SetDescription(description);
+	option->SetRequired(required);
+
+	cell id = g_NextCommandOptionId++;
+	if (id == 0)
+	{
+		id = g_NextCommandOptionId++;
+	}
+
+	g_PendingCommandOptionIndex.emplace(id, option.get());
+
+	if (parent_option_id != 0)
+	{
+		auto parent_it = g_PendingCommandOptionIndex.find(parent_option_id);
+		if (parent_it == g_PendingCommandOptionIndex.end() || parent_it->second == nullptr)
+		{
+			Logger::Get()->LogNative(samplog_LogLevel::ERROR, "invalid parent option '{}'", parent_option_id);
+			g_PendingCommandOptionIndex.erase(id);
+			return 0;
+		}
+
+		COMMAND_OPTION_TYPE parent_type = parent_it->second->GetType();
+		if (parent_type == COMMAND_OPTION_TYPE::OPTION_SUB_COMMAND_GROUP &&
+			type != static_cast<int>(COMMAND_OPTION_TYPE::OPTION_SUB_COMMAND))
+		{
+			Logger::Get()->LogNative(
+				samplog_LogLevel::ERROR,
+				"sub-command groups may only contain sub-commands");
+			g_PendingCommandOptionIndex.erase(id);
+			return 0;
+		}
+
+		if (parent_type == COMMAND_OPTION_TYPE::OPTION_SUB_COMMAND &&
+			(type == static_cast<int>(COMMAND_OPTION_TYPE::OPTION_SUB_COMMAND) ||
+				type == static_cast<int>(COMMAND_OPTION_TYPE::OPTION_SUB_COMMAND_GROUP)))
+		{
+			Logger::Get()->LogNative(
+				samplog_LogLevel::ERROR,
+				"sub-commands may not contain sub-commands or sub-command groups");
+			g_PendingCommandOptionIndex.erase(id);
+			return 0;
+		}
+
+		parent_it->second->AddOption(option->GetName(), option);
+	}
+	else
+	{
+		g_PendingCommandOptions.emplace(id, std::move(option));
+	}
+
+	Logger::Get()->LogNative(samplog_LogLevel::DEBUG, "return value: '{}'", id);
+	return id;
 }
-*/
 
 // native DCC_SetCommandPermission(DCC_Command:command, DCC_Role:role, bool:enable);
 /*AMX_DECLARE_NATIVE(Native::DCC_SetCommandPermission)
